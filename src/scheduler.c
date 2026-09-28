@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "queue.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,18 +27,28 @@ static int append(ScheduleResult *r, size_t p, int64_t start, int64_t end) {
 int schedule(const Process *input, size_t n, Algorithm algorithm, int64_t quantum,
              ScheduleResult *r, char *error, size_t error_size) {
     Arrival *sorted = NULL;
+    Queue ready = {0};
     size_t i, completed = 0, next = 0;
     int64_t now = 0, total = 0, latest = 0;
     const char *reason = NULL;
-    (void)quantum;
     memset(r, 0, sizeof(*r));
-    if (!input || !n || n > MAX_PROCESSES || (algorithm != FCFS && algorithm != SJF)) { reason = "Invalid scheduling configuration"; goto fail; }
+    if (!input || !n || n > MAX_PROCESSES || (algorithm != FCFS && algorithm != SJF && algorithm != RR)) { reason = "Invalid scheduling configuration"; goto fail; }
+    if (algorithm == RR && quantum <= 0) { reason = "RR quantum must be positive"; goto fail; }
     for (i = 0; i < n; ++i) {
         if (input[i].arrival < 0 || input[i].burst <= 0 || total > INT64_MAX - input[i].burst) { reason = "Invalid process times or time overflow"; goto fail; }
         total += input[i].burst;
         if (input[i].arrival > latest) latest = input[i].arrival;
     }
     if (latest > INT64_MAX - total) { reason = "Time overflow: latest arrival plus total burst exceeds int64"; goto fail; }
+    if (algorithm == RR) {
+        int64_t slices = 0;
+        for (i = 0; i < n; ++i) {
+            int64_t needed = input[i].burst / quantum + (input[i].burst % quantum != 0);
+            if (needed > 1000000 - slices) { reason = "RR limit: at most 1000000 dispatches; increase quantum"; goto fail; }
+            slices += needed;
+        }
+        if (!queue_init(&ready, n)) { reason = "Queue allocation failed"; goto fail; }
+    }
     r->processes = malloc(n * sizeof(*input)); sorted = malloc(n * sizeof(*sorted));
     if (!r->processes || !sorted) { reason = "Allocation failed"; goto fail; }
     memcpy(r->processes, input, n * sizeof(*input)); r->count = n;
@@ -50,6 +61,31 @@ int schedule(const Process *input, size_t n, Algorithm algorithm, int64_t quantu
         size_t selected = SIZE_MAX;
         int64_t arrival = INT64_MAX;
         Process *p;
+        if (algorithm == RR) {
+            int64_t duration;
+            while (next < n && sorted[next].arrival <= now) {
+                if (!queue_push(&ready, sorted[next++].index)) { reason = "Queue capacity error"; goto fail; }
+            }
+            if (!ready.size) {
+                arrival = sorted[next].arrival;
+                if (!append(r, SIZE_MAX, now, arrival)) { reason = "Allocation failed"; goto fail; }
+                r->idle += arrival - now; now = arrival; continue;
+            }
+            if (!queue_pop(&ready, &selected)) { reason = "Queue underflow"; goto fail; }
+            p = &r->processes[selected];
+            if (p->first_run < 0) p->first_run = now;
+            duration = p->remaining < quantum ? p->remaining : quantum;
+            if (!append(r, selected, now, now + duration)) { reason = "Allocation failed"; goto fail; }
+            now += duration; p->remaining -= duration;
+            /* Include arrivals exactly at the quantum boundary before requeue. */
+            while (next < n && sorted[next].arrival <= now) {
+                if (!queue_push(&ready, sorted[next++].index)) { reason = "Queue capacity error"; goto fail; }
+            }
+            if (p->remaining) {
+                if (!queue_push(&ready, selected)) { reason = "Queue capacity error"; goto fail; }
+            } else { p->completion = now; ++completed; }
+            continue;
+        }
         if (algorithm == FCFS) selected = sorted[next++].index;
         else {
             for (i = 0; i < n; ++i) {
@@ -82,7 +118,7 @@ int schedule(const Process *input, size_t n, Algorithm algorithm, int64_t quantu
         r->avg_waiting += (double)(turnaround - p->burst) / (double)n;
         r->avg_response += (double)(p->first_run - p->arrival) / (double)n;
     }
-    free(sorted); return 1;
+    free(sorted); queue_destroy(&ready); return 1;
 fail:
-    snprintf(error, error_size, "%s", reason); free(sorted); result_destroy(r); return 0;
+    snprintf(error, error_size, "%s", reason); free(sorted); queue_destroy(&ready); result_destroy(r); return 0;
 }
